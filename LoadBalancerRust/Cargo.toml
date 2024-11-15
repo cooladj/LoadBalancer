@@ -1,0 +1,19 @@
+[package]
+name = "KeyDownRemap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+enigo = "0.2.1"
+actix-web = "4.9.0"
+serde = { version = "1.0.215", features = ["derive"] }
+axum = "0.8.0-alpha.1"
+tokio = "1.41.1"
+tower-http = "0.6.1"
+tracing-subscriber = "0.3.18"
+tracing = "0.1.40"
+cors = "0.1.0"
+actix-cors = "0.7.0"
+serde_json = "1.0.132"
+reqwest = "0.12.9"
+queues = "1.1.0"

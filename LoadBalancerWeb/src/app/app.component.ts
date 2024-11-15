@@ -23,13 +23,14 @@ export class AppComponent implements OnInit {
   constructor(private http: HttpClient) {}
 
   ngOnInit() {
-    const port = Number(window.location.port);
-    if (!port) {
-      console.error('No port number available');
+    const origin = (window.location.origin);
+    console.log("this is the origin", origin);
+    if (!origin) {
+      console.error('No origin number available');
       return;
     }
 
-    this.http.put<PortResponse>(this.API_URL, { number: port })
+    this.http.put<PortResponse>(this.API_URL, { origin: origin })
       .pipe(
         take(1),
         catchError(this.handleError)
@@ -39,7 +40,7 @@ export class AppComponent implements OnInit {
           console.log('Port registered:', response.message);
         },
         error: (error) => {
-          console.error('Failed to register port:', error);
+          console.error('Failed to register origin:', error);
         }
       });
   }
