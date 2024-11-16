@@ -1,4 +1,4 @@
-﻿use actix_web::{web, App, HttpResponse, HttpServer, put, options, get, HttpRequest};
+﻿use actix_web::{web, App, HttpResponse, HttpServer, put, options, get, HttpRequest, middleware};
 use actix_cors::Cors;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -6,12 +6,6 @@ use queues::*;
 
 struct AppState {
     port_numbers: Mutex<Queue<String>>,
-    current_index: Mutex<usize>,
-}
-
-#[derive(Deserialize)]
-struct NumberPayload {
-    origin: String,
 }
 
 #[derive(Serialize)]
@@ -20,56 +14,83 @@ struct Response {
     current_numbers: Vec<String>,
 }
 
+
 #[get("/")]
 async fn get_serve(
     state: web::Data<AppState>,
-    req: HttpRequest,
-) -> HttpResponse {
-    let mut queue = state.port_numbers.lock().unwrap();
+) -> actix_web::Result<HttpResponse> {
+    log::info!("Processing request");
+    let mut queue = state.port_numbers.lock().map_err(|e| {
+        log::error!("Failed to acquire lock: {}", e);
+        actix_web::error::ErrorInternalServerError("Lock acquisition failed")
+    })?;
 
     if queue.size() == 0 {
-        return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+        return Ok(HttpResponse::ServiceUnavailable().json(serde_json::json!({
             "error": "No available origins"
-        }));
+        })));
     }
 
-    let target_origin = match queue.remove() {
-        Ok(origin) => {
-            if let Err(e) = queue.add(origin.clone()) {
-                eprintln!("Failed to re-add origin to queue: {}", e);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    while queue.size() > 0 {
+        let origin = queue.remove().map_err(|e| {
+            log::error!("Failed to get next origin: {}", e);
+            actix_web::error::ErrorInternalServerError("Queue operation failed")
+        })?;
+
+        match client.get(&format!("{}/healthCheck", origin)).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    if let Err(e) = queue.add(origin.clone()) {
+                        log::error!("Failed to re-add successful origin to queue: {}", e);
+                    }
+
+                    log::info!("Redirecting to healthy origin: {}", origin);
+
+                    return Ok(HttpResponse::TemporaryRedirect()
+                        .insert_header(("Location", origin))
+                        .finish());
+                } else {
+                    log::warn!("Health check returned non-200 status for {}: {}", origin, response.status());
+                }
+            },
+            Err(e) => {
+                log::warn!("Health check failed for {}: {}", origin, e);
             }
-            origin
-        },
-        Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": "Failed to get next origin"
-        }))
-    };
+        }
+    }
 
-    let redirect_url = format!("{}{}",
-                               target_origin,
-                               req.uri().path_and_query()
-                                   .map(|x| x.as_str())
-                                   .unwrap_or("")
-    );
-
-    println!("Redirecting to origin: {}", target_origin);
-
-    HttpResponse::PermanentRedirect()
-        .append_header(("Location", redirect_url))
-        .finish()
+    Ok(HttpResponse::ServiceUnavailable().json(serde_json::json!({
+        "error": "No healthy origins available"
+    })))
 }
 
 #[put("/port")]
 async fn add_number(
-    data: web::Json<NumberPayload>,
+    req: HttpRequest,
     state: web::Data<AppState>,
 ) -> HttpResponse {
-    println!("Port endpoint accessed - Attempting to add: {}", data.origin);
+    let origin = match req.headers().get("origin") {
+        Some(o) => match o.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "Invalid origin header",
+                "status": "error"
+            }))
+        },
+        None => return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Missing origin header",
+            "status": "error"
+        }))
+    };
 
-    // Validate input
-    if data.origin.is_empty() {
+    if !origin.starts_with("http://") && !origin.starts_with("https://") {
         return HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "Origin cannot be empty",
+            "error": "Origin must start with http:// or https://",
             "status": "error"
         }));
     }
@@ -77,7 +98,7 @@ async fn add_number(
     let mut queue = match state.port_numbers.lock() {
         Ok(queue) => queue,
         Err(_) => {
-            println!("Failed to acquire lock on queue");
+            log::error!("Failed to acquire lock on queue");
             return HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": "Internal server error",
                 "status": "error"
@@ -89,13 +110,13 @@ async fn add_number(
     let mut exists = false;
     let mut current_origins = Vec::new();
 
-    while let Ok(origin) = queue.remove() {
-        if origin == data.origin {
+    while let Ok(existing_origin) = queue.remove() {
+        if existing_origin == origin {
             exists = true;
         }
-        current_origins.push(origin.clone());
-        if let Err(_) = temp_queue.add(origin) {
-            println!("Failed to add to temporary queue");
+        current_origins.push(existing_origin.clone());
+        if let Err(_) = temp_queue.add(existing_origin) {
+            log::error!("Failed to add to temporary queue");
             return HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": "Internal server error",
                 "status": "error"
@@ -105,7 +126,7 @@ async fn add_number(
 
     while let Ok(origin) = temp_queue.remove() {
         if let Err(_) = queue.add(origin) {
-            println!("Failed to restore queue");
+            log::error!("Failed to restore queue");
             return HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": "Internal server error",
                 "status": "error"
@@ -114,26 +135,26 @@ async fn add_number(
     }
 
     if exists {
-        println!("Origin {} already exists", data.origin);
+        log::error!("Origin {} already exists", origin);
         return HttpResponse::BadRequest().json(serde_json::json!({
             "error": "Origin already exists",
-            "origin": data.origin,
+            "origin": origin,
             "status": "error"
         }));
     }
 
-    if let Err(_) = queue.add(data.origin.clone()) {
-        println!("Failed to add new origin to queue");
+    if let Err(_) = queue.add(origin.clone()) {
+        log::error!("Failed to add new origin to queue");
         return HttpResponse::InternalServerError().json(serde_json::json!({
             "error": "Failed to add origin to queue",
             "status": "error"
         }));
     }
 
-    current_origins.push(data.origin.clone());
+    current_origins.push(origin.clone());
 
     let response = Response {
-        message: format!("Successfully added origin: {}", data.origin),
+        message: format!("Successfully added origin: {}", origin),
         current_numbers: current_origins,
     };
 
@@ -148,27 +169,40 @@ async fn add_number(
 
 #[options("/port")]
 async fn options_handler() -> HttpResponse {
-    HttpResponse::Ok().finish()
+    HttpResponse::Ok()
+        .append_header(("Access-Control-Allow-Methods", "PUT, OPTIONS"))
+        .append_header(("Access-Control-Allow-Headers", "origin"))
+        .finish()
 }
 
 #[actix_web::main]
 pub async fn main() -> std::io::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+        .format(|buf, record| {
+            use std::io::Write;
+            writeln!(
+                buf,
+                "{} [{}] - {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
+
     let app_state = web::Data::new(AppState {
         port_numbers: Mutex::new(Queue::new()),
-        current_index: Mutex::new(0),
     });
-
-    println!("Server starting at http://127.0.0.1:8080");
+    log::info!("Server starting at http://127.0.0.1:8080");
 
     HttpServer::new(move || {
-        let cors = Cors::permissive()
-            .max_age(3600);
+        let cors = Cors::permissive();
 
         App::new()
             .wrap(cors)
+            .wrap(middleware::Logger::default())  // Add logger middleware
             .app_data(app_state.clone())
             .service(add_number)
-            .service(options_handler)
             .service(get_serve)
     })
         .bind("127.0.0.1:8080")?
